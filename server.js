@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3020);
@@ -44,7 +44,8 @@ const initialData = {
       repairedAt: null
     }
   ],
-  batches: []
+  batches: [],
+  transfers: []
 };
 
 const routes = [
@@ -58,7 +59,9 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  "POST /batches/:id/transfers",
+  "GET /transfers?damageId=&batchId=&rubbingId="
 ];
 
 async function ensureDb() {
@@ -72,11 +75,33 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 旧数据文件缺少移交集合时按空处理
+  if (!Array.isArray(db.transfers)) db.transfers = [];
+  return db;
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  const tmpFile = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
+}
+
+// 串行化"读-校验-写"事务，保证并发重复移交仅一次成功
+let transferChain = Promise.resolve();
+function withTransferLock(task) {
+  const run = transferChain.then(task, task);
+  transferChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
 }
 
 function send(res, status, body) {
@@ -121,14 +146,80 @@ function findRubbing(db, rubbingId) {
 }
 
 function enrichBatch(db, batch) {
-  const damages = db.damages.filter((item) => batch.damageIds.includes(item.id));
+  const damages = db.damages.filter((item) => (batch.damageIds || []).includes(item.id));
+  // 旧批次可能没有移交字段，按空处理
+  const transfers = Array.isArray(batch.transfers) ? batch.transfers : [];
   return {
     ...batch,
+    transfers,
     damages,
     total: damages.length,
     repaired: damages.filter((item) => item.status === "repaired").length,
     pending: damages.filter((item) => item.status !== "repaired").length
   };
+}
+
+// 在锁内重新读盘执行移交：任一前置条件不满足则 409 且数据不变
+async function executeTransfer(sourceBatchId, targetBatchId, damageId, reason) {
+  const db = await readDb();
+
+  const sourceBatch = db.batches.find((item) => item.id === sourceBatchId);
+  if (!sourceBatch) throw httpError(404, "源修补批次不存在");
+  const targetBatch = db.batches.find((item) => item.id === targetBatchId);
+  if (!targetBatch) throw httpError(404, "目标修补批次不存在");
+  const damage = db.damages.find((item) => item.id === damageId);
+  if (!damage) throw httpError(404, "缺损项不存在");
+
+  // 冲突条件（409）必须先于任何写操作完成校验
+  const conflict =
+    sourceBatch.status === "completed"
+      ? "源批次已结项，不能移交缺损"
+      : targetBatch.status === "completed"
+        ? "目标批次已结项，不能接收缺损"
+        : !(sourceBatch.damageIds || []).includes(damageId)
+          ? "缺损不属于源批次"
+          : (targetBatch.damageIds || []).includes(damageId)
+            ? "目标批次已包含该缺损"
+            : null;
+  if (conflict) throw httpError(409, conflict);
+
+  if (damage.status === "repaired") throw httpError(409, "缺损已修复，不能移交");
+
+  // 跨拓片判定：以批次内缺损的实际归属为准（旧批次无 rubbingId 字段）
+  const batchRubbingIds = (batch) =>
+    new Set(
+      (batch.damageIds || [])
+        .map((id) => db.damages.find((item) => item.id === id))
+        .filter(Boolean)
+        .map((item) => item.rubbingId)
+    );
+  const foreignTarget = [...batchRubbingIds(targetBatch)].some((rubbingId) => rubbingId !== damage.rubbingId);
+  if (foreignTarget) throw httpError(409, "不能跨拓片移交缺损");
+
+  // 执行移交：源批次移除，目标批次接收
+  sourceBatch.damageIds = sourceBatch.damageIds.filter((id) => id !== damageId);
+  targetBatch.damageIds.push(damageId);
+  damage.batchId = targetBatchId;
+  // 缺损创建时间、修补状态与已有修补结果（afterPhotoUrl/repairNote 等）原样保留
+
+  const record = {
+    id: makeId("transfer"),
+    damageId,
+    rubbingId: damage.rubbingId,
+    sourceBatchId,
+    targetBatchId,
+    reason: reason || "",
+    createdAt: new Date().toISOString()
+  };
+  db.transfers.push(record);
+  // 批次内保留只读移交记录：source 标记 out，target 标记 in
+  if (!Array.isArray(sourceBatch.transfers)) sourceBatch.transfers = [];
+  if (!Array.isArray(targetBatch.transfers)) targetBatch.transfers = [];
+  sourceBatch.transfers.push({ ...record, direction: "out" });
+  targetBatch.transfers.push({ ...record, direction: "in" });
+
+  await writeDb(db);
+  return record;
 }
 
 async function handle(req, res) {
@@ -238,6 +329,7 @@ async function handle(req, res) {
       name: body.name,
       status: "open",
       damageIds: body.damageIds,
+      transfers: [],
       note: body.note || "",
       createdAt: new Date().toISOString(),
       completedAt: null
@@ -279,6 +371,31 @@ async function handle(req, res) {
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
+  }
+
+  const transferMatch = pathname.match(/^\/batches\/([^/]+)\/transfers$/);
+  if (transferMatch && req.method === "POST") {
+    const sourceBatchId = transferMatch[1];
+    const body = await parseBody(req);
+    required(body, ["targetBatchId", "damageId"]);
+    // 事务锁内重新读盘，保证并发重复移交仅一次成功
+    const record = await withTransferLock(() =>
+      executeTransfer(sourceBatchId, body.targetBatchId, body.damageId, body.reason || "")
+    );
+    return send(res, 200, { data: record });
+  }
+
+  if (req.method === "GET" && pathname === "/transfers") {
+    const damageId = url.searchParams.get("damageId");
+    const batchId = url.searchParams.get("batchId");
+    const rubbingId = url.searchParams.get("rubbingId");
+    const data = db.transfers.filter(
+      (item) =>
+        (!damageId || item.damageId === damageId) &&
+        (!batchId || item.sourceBatchId === batchId || item.targetBatchId === batchId) &&
+        (!rubbingId || item.rubbingId === rubbingId)
+    );
+    return send(res, 200, { data });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
