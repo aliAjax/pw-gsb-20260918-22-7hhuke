@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3020);
@@ -44,7 +44,8 @@ const initialData = {
       repairedAt: null
     }
   ],
-  batches: []
+  batches: [],
+  transfers: []
 };
 
 const routes = [
@@ -58,6 +59,9 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
+  "POST /batches/:id/transfer",
+  "GET /batches/:id/transfers",
+  "GET /transfers",
   "POST /batches/:id/complete"
 ];
 
@@ -72,11 +76,34 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 旧版本数据缺少移交相关集合时按空处理
+  if (!Array.isArray(db.rubbings)) db.rubbings = [];
+  if (!Array.isArray(db.damages)) db.damages = [];
+  if (!Array.isArray(db.batches)) db.batches = [];
+  if (!Array.isArray(db.transfers)) db.transfers = [];
+  db.batches.forEach((batch) => {
+    if (!Array.isArray(batch.damageIds)) batch.damageIds = [];
+  });
+  return db;
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  // 临时文件 + 重命名，保证移交等写入结果完整落盘
+  const tmp = `${DB_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, DB_FILE);
+}
+
+// 写操作串行化，避免并发移交产生丢失更新
+let writeChain = Promise.resolve();
+function withWrite(task) {
+  const run = writeChain.then(task, task);
+  writeChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
 }
 
 function send(res, status, body) {
@@ -120,8 +147,27 @@ function findRubbing(db, rubbingId) {
   return rubbing;
 }
 
+function conflict(message) {
+  const error = new Error(message);
+  error.status = 409;
+  return error;
+}
+
+// 实际归属：批次 damageIds 中登记，且缺损 batchId 仍指向该批次
+// （旧批次缺少 damageIds 时按空处理；移交后源批次不再统计该缺损）
+function batchDamageIds(db, batch) {
+  if (!Array.isArray(batch.damageIds)) return [];
+  return batch.damageIds.filter((id) => {
+    const damage = db.damages.find((item) => item.id === id);
+    return damage && damage.batchId === batch.id;
+  });
+}
+
 function enrichBatch(db, batch) {
-  const damages = db.damages.filter((item) => batch.damageIds.includes(item.id));
+  const ids = batchDamageIds(db, batch);
+  const damages = ids
+    .map((id) => db.damages.find((item) => item.id === id))
+    .filter(Boolean);
   return {
     ...batch,
     damages,
@@ -129,6 +175,13 @@ function enrichBatch(db, batch) {
     repaired: damages.filter((item) => item.status === "repaired").length,
     pending: damages.filter((item) => item.status !== "repaired").length
   };
+}
+
+// 只读移交记录：以全局 transfers 为准（旧批次无移交字段时按空处理）
+function batchTransfers(db, batch) {
+  return db.transfers.filter(
+    (item) => item.fromBatchId === batch.id || item.toBatchId === batch.id
+  );
 }
 
 async function handle(req, res) {
@@ -257,7 +310,92 @@ async function handle(req, res) {
   if (batchMatch && req.method === "GET") {
     const batch = db.batches.find((item) => item.id === batchMatch[1]);
     if (!batch) return send(res, 404, { error: "修补批次不存在" });
-    return send(res, 200, { data: enrichBatch(db, batch) });
+    const detail = enrichBatch(db, batch);
+    detail.transfers = batchTransfers(db, batch);
+    return send(res, 200, { data: detail });
+  }
+
+  const batchTransfersMatch = pathname.match(/^\/batches\/([^/]+)\/transfers$/);
+  if (batchTransfersMatch && req.method === "GET") {
+    const batch = db.batches.find((item) => item.id === batchTransfersMatch[1]);
+    if (!batch) return send(res, 404, { error: "修补批次不存在" });
+    return send(res, 200, { data: batchTransfers(db, batch) });
+  }
+
+  if (req.method === "GET" && pathname === "/transfers") {
+    const damageId = url.searchParams.get("damageId");
+    const batchId = url.searchParams.get("batchId");
+    const data = db.transfers.filter(
+      (item) =>
+        (!damageId || item.damageId === damageId) &&
+        (!batchId || item.fromBatchId === batchId || item.toBatchId === batchId)
+    );
+    return send(res, 200, { data });
+  }
+
+  const transferMatch = pathname.match(/^\/batches\/([^/]+)\/transfer$/);
+  if (transferMatch && req.method === "POST") {
+    const sourceBatch = db.batches.find((item) => item.id === transferMatch[1]);
+    if (!sourceBatch) return send(res, 404, { error: "源修补批次不存在" });
+
+    const body = await parseBody(req);
+    required(body, ["damageId", "toBatchId"]);
+
+    const targetBatch = db.batches.find((item) => item.id === body.toBatchId);
+    if (!targetBatch) return send(res, 404, { error: "目标修补批次不存在" });
+
+    const damage = db.damages.find((item) => item.id === body.damageId);
+    if (!damage) return send(res, 404, { error: "缺损项不存在" });
+
+    // 以下冲突整单返回 409 且不变更任何数据
+    if (sourceBatch.status !== "open") throw conflict("源批次已结项，不能移交");
+    if (targetBatch.status !== "open") throw conflict("目标批次已结项，不能移交");
+    if (damage.status === "repaired") throw conflict("缺损已修复，不能移交");
+    if (!batchDamageIds(db, sourceBatch).includes(damage.id)) {
+      throw conflict("该缺损不属于源批次，不能移交");
+    }
+    if (batchDamageIds(db, targetBatch).includes(damage.id)) {
+      throw conflict("目标批次已包含该缺损，不能重复移交");
+    }
+    const targetRubbingIds = new Set(
+      batchDamageIds(db, targetBatch)
+        .map((id) => db.damages.find((item) => item.id === id))
+        .filter(Boolean)
+        .map((item) => item.rubbingId)
+    );
+    if (targetRubbingIds.size > 0 && !targetRubbingIds.has(damage.rubbingId)) {
+      throw conflict("不能跨拓片移交缺损");
+    }
+
+    // 执行移交：源批次移除、目标批次接收；缺损创建时间与已有修补结果保留
+    sourceBatch.damageIds = (Array.isArray(sourceBatch.damageIds) ? sourceBatch.damageIds : []).filter(
+      (id) => id !== damage.id
+    );
+    if (!Array.isArray(targetBatch.damageIds)) targetBatch.damageIds = [];
+    targetBatch.damageIds.push(damage.id);
+    damage.batchId = targetBatch.id;
+
+    // 移交记录只增不改，全部随库落盘
+    const transfer = {
+      id: makeId("transfer"),
+      damageId: damage.id,
+      rubbingId: damage.rubbingId,
+      fromBatchId: sourceBatch.id,
+      toBatchId: targetBatch.id,
+      reason: body.reason || "",
+      createdAt: new Date().toISOString()
+    };
+    db.transfers.push(transfer);
+    await writeDb(db);
+
+    return send(res, 201, {
+      data: {
+        transfer,
+        damage,
+        sourceBatch: enrichBatch(db, sourceBatch),
+        targetBatch: enrichBatch(db, targetBatch)
+      }
+    });
   }
 
   const completeMatch = pathname.match(/^\/batches\/([^/]+)\/complete$/);
@@ -270,7 +408,7 @@ async function handle(req, res) {
     batch.completedAt = new Date().toISOString();
     batch.note = body.note ?? batch.note;
     db.damages.forEach((damage) => {
-      if (!batch.damageIds.includes(damage.id)) return;
+      if (!batchDamageIds(db, batch).includes(damage.id)) return;
       const result = results.find((item) => item.damageId === damage.id) || {};
       damage.status = "repaired";
       damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
@@ -285,7 +423,13 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  const run = () => handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  // 读请求直接执行；写请求串行化，保证并发移交等竞态只有一次生效
+  if (req.method === "GET" || req.method === "HEAD") {
+    run();
+  } else {
+    withWrite(run);
+  }
 });
 
 server.listen(PORT, () => {
